@@ -1,0 +1,7 @@
+stable-baselines3==2.2.1
+gymnasium
+torch
+numpy
+matplotlib
+tqdm
+pyyaml
