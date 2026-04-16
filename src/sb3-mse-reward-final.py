@@ -1,0 +1,1117 @@
+from dataclasses import dataclass
+from typing import *
+
+import gymnasium as gym
+import numpy as np
+from math import gamma
+from gymnasium import *
+import matplotlib.pyplot as plt
+from matplotlib import animation
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from collections import deque
+from tqdm.auto import tqdm
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
+
+LOG_FILE = open("/netscratch/nham/logs/training_debug_log_ppo_8.txt", "w", encoding="utf-8")
+def log(*args):
+    LOG_FILE.write(" ".join(str(x) for x in args) + "\n")
+    LOG_FILE.flush()
+
+# checkpoint
+CKPT_DIR = "/netscratch/nham/checkpoints"
+BEST_MODEL_PATH = os.path.join(CKPT_DIR, "best_model_8")
+
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+@dataclass(frozen=True)
+class ColdSprayConfig:
+    grid_n: int = 128
+    dx_max: float = 0.1
+    dy_max: float = 0.1
+
+    v_max: float = 0.03
+    off_max: float = 0.01
+
+    f_init: float = 2.0
+    f_min: float = 0.05
+    dt: float = 2.0
+    max_steps: int = 20000
+    seed: Optional[int] = None
+
+    sigma: float = 0.02
+    beta: float = 2.0
+    eta: float = 0.4
+    rho_m: float = 6500.0
+    samples_per_pixel: float = 1.0
+    A_amp: float = 1.0
+    target_height: float = 0.2
+    overfill_ratio: float = 1.01
+
+class DepositionModel:
+    def __init__(self, grid_n: int, sigma: float = 0.02, beta: float = 2.0, eta: float = 0.4, rho_m: float = 6500.0, samples_per_pixel: float = 1.0,
+                 A_amp: float = 1.0, overfill_ratio: float = 1.01, target_height: float = 0.2) -> None:
+        self.n = int(grid_n)
+        self.sigma = float(sigma)
+        self.beta = float(beta)
+        self.eta = float(eta)
+        self.rho_m = float(rho_m)
+        self.spp = float(samples_per_pixel)
+        self.A_amp = A_amp
+        self.overfill_ratio = float(overfill_ratio)
+        self.target_height = float(target_height)
+
+        self._pix_area = (1.0 / self.n) ** 2
+        self._C = self.beta * self._pix_area / (2.0 * np.pi * (self.sigma**2) * gamma(2.0 / self.beta))
+        grid = (np.arange(self.n, dtype=np.float32) + 0.5) / self.n
+        self.Y, self.X = np.meshgrid(grid, grid, indexing="ij") #indexing="xy"
+
+    def _kernel(self, r: np.ndarray) -> np.ndarray:
+        k = self.A_amp * self._C * np.exp(- (r / self.sigma) ** self.beta)
+        return k
+
+    def apply(self, height, x0, y0, x1, y1, f, dt, use_target_mask: bool = False):
+        overfill_ratio = self.overfill_ratio
+        target_height = self.target_height
+
+        dx, dy = float(x1 - x0), float(y1 - y0)
+        L = float(np.hypot(dx, dy))
+
+        if f <= 0.0 or dt <= 0.0:
+            return np.zeros_like(height, dtype=np.float32)
+
+        #CASE A: L = 0  → point spray, use limit L→0
+        if (L<1e-7):
+            M_in = self.eta * float(f) * dt
+            r = np.hypot(self.X - x0, self.Y - y0)
+            k = self._kernel(r)
+            pix_area = self._pix_area
+            sum_k = float(np.sum(k)) #=1
+            factor = M_in / (self.rho_m * pix_area * (sum_k + 1e-16))
+
+            delta_h = k * factor
+            return delta_h.astype(np.float32, copy=False)
+
+        #CASE B: L > 0  → apply normally
+        v = L / dt
+        lam = (self.eta * float(f)) / v
+
+        ds_target = (1.0 / self.n) / max(self.spp, 1e-6)
+        S = max(1, int(np.ceil(L / ds_target)))
+
+        s = (np.arange(S, dtype=np.float32) + 0.5) * (L / S)
+        xs = x0 + (dx / L) * s
+        ys = y0 + (dy / L) * s
+
+        delta_h = np.zeros_like(height, dtype=np.float32)
+        for k in range(S):
+            r = np.hypot(self.X - xs[k], self.Y - ys[k])
+            delta_h += self._kernel(r)
+
+        factor = (lam / (self.rho_m * self._pix_area)) * (L / S)
+        delta_h *= factor
+
+        if use_target_mask:
+            cutoff_target = float(target_height)
+            target_mask = (height >= cutoff_target).astype(np.float32)
+            delta_h *= (1.0 - target_mask)
+
+        return delta_h.astype(np.float32, copy=False)
+
+class ColdSprayEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, config: Optional[ColdSprayConfig] = None) -> None:
+        super().__init__()
+        self.cfg = config or ColdSprayConfig()
+        self._rng = np.random.default_rng(self.cfg.seed)
+
+        N = self.cfg.grid_n
+        self.height = np.zeros((N, N), dtype=np.float32)
+
+        #self.x, self.y, self.f = 0.5, 0.5, 0.0
+        #self.x, self.y = 0.5, 0.5; self.f = 1.0      #fixed feed rate
+        self.x, self.y = 0.5, 0.5; self.f = float(self.cfg.f_init)
+        self._steps = 0
+
+        # state = [x, y, s_norm, off]
+        low_state  = np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32)
+        high_state = np.array([1.0, 1.0, 1.0,  1.0], dtype=np.float32)
+
+        self.observation_space = spaces.Dict({
+            "height": spaces.Box(low=-np.inf, high=np.inf, shape=(N, N), dtype=np.float32),
+            "state": spaces.Box(low=low_state, high=high_state, shape=(4,), dtype=np.float32),
+            "target_map": spaces.Box(low=0.0, high=1.0, shape=(N, N), dtype=np.float32),
+            "path_map": spaces.Box(low=0.0, high=1.0, shape=(N, N), dtype=np.float32),
+        }) #shape=(3,)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32) #shape=(3,)
+
+        self.deposition = DepositionModel(
+            grid_n=N, sigma=self.cfg.sigma, beta=self.cfg.beta,
+            eta=self.cfg.eta, rho_m=self.cfg.rho_m,
+            samples_per_pixel=self.cfg.samples_per_pixel, A_amp=self.cfg.A_amp,
+            target_height=self.cfg.target_height, overfill_ratio=self.cfg.overfill_ratio)
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._steps = 0
+        self.prev_min_h = None
+        self.x, self.y = 0.5, 0.5; self.f = float(self.cfg.f_init)
+
+        if options is not None and "height0" in options and options["height0"] is not None:
+            h0 = np.asarray(options["height0"])
+            assert h0.shape == self.height.shape
+            self.height = h0.astype(np.float32, copy=True)
+        else:
+            self.height.fill(0.0)
+
+        # 2D target map
+        BOX_MIN = 0.25; BOX_MAX = 0.75
+        N = self.height.shape[0]
+
+        self.H_target_map = np.zeros((N, N), dtype=np.float32)
+        ix0 = int(BOX_MIN * N)
+        ix1 = int(BOX_MAX * N)
+        iy0 = int(BOX_MIN * N)
+        iy1 = int(BOX_MAX * N)
+
+        self.H_target_map[iy0:iy1, ix0:ix1] = self.cfg.target_height # pixel in box = target = 0.2
+        self.H_over_map = self.H_target_map * self.cfg.overfill_ratio # map overfill
+        # Raster path mask (image channel)
+        self.path_map = self._make_raster_path_mask(
+            N=N,
+            box_min=BOX_MIN,
+            box_max=BOX_MAX,
+            spacing_px=6,
+            thickness_px=1
+        )
+
+        # ---- Pass 1: horizontal snake (0,0) -> (1,1) ----
+        self._snake_pts_h, self._snake_cumlen_h = self._build_snake_polyline(
+            box_min=BOX_MIN,
+            box_max=BOX_MAX,
+            spacing_px=6
+        )
+        self._snake_total_h = float(self._snake_cumlen_h[-1])
+
+        # ---- Pass 2: vertical snake, reversed so it starts at (1,1) and ends at (0,0) ----
+        snake_pts_v, _ = self._build_snake_polyline_vertical(
+            box_min=BOX_MIN,
+            box_max=BOX_MAX,
+            spacing_px=6,
+            between_pixels=True
+        )
+        self._snake_pts_v, self._snake_cumlen_v = self._reverse_polyline(snake_pts_v)
+        self._snake_total_v = float(self._snake_cumlen_v[-1])
+
+        # ---- Enforce continuity: start of raster-2 = end of raster-1 (no teleport, no hard-coded coords) ----
+        p_end = self._snake_pts_h[-1]  # endpoint of raster-1 polyline in (x,y)
+
+        # find nearest vertex on raster-2 polyline
+        d2 = np.sum((self._snake_pts_v - p_end[None, :])**2, axis=1)
+        k0 = int(np.argmin(d2))
+
+        # rotate raster-2 vertices so that index 0 is closest to raster-1 endpoint
+        self._snake_pts_v = np.concatenate([self._snake_pts_v[k0:], self._snake_pts_v[:k0]], axis=0).astype(np.float32)
+
+        # rebuild cumulative arc-length for raster-2 after rotation
+        dif = self._snake_pts_v[1:] - self._snake_pts_v[:-1]
+        seg = np.sqrt(np.sum(dif * dif, axis=1))
+        self._snake_cumlen_v = np.concatenate([[0.0], np.cumsum(seg)]).astype(np.float32)
+        self._snake_total_v = float(self._snake_cumlen_v[-1])
+
+        # start in pass 0
+        self.pass_id = 0
+
+        # set active snake to horizontal
+        self._snake_pts = self._snake_pts_h
+        self._snake_cumlen = self._snake_cumlen_h
+        self._snake_total = self._snake_total_h
+
+        self.s = 0.0
+        self.off = 0.0
+
+        bx, by, tx, ty = self._snake_pose_at_s(self.s)
+        self.x, self.y = bx, by
+
+        s_norm = 0.0 if self._snake_total <= 1e-12 else float(self.s / self._snake_total)
+        obs = {
+            "height": self.height.copy(),
+            "state": np.array([self.x, self.y, s_norm, float(self.off)], dtype=np.float32),
+            "target_map": self.H_target_map.copy(),
+            "path_map": self.path_map.copy(),}
+        info = {}
+        return obs, info
+
+    def _make_raster_path_mask(self, N: int, box_min: float, box_max: float, spacing_px: int = 6, thickness_px: int = 1):
+        """
+        Create a simple zigzag raster path mask inside [box_min, box_max]^2.
+        - spacing_px: distance between raster lines in pixels
+        - thickness_px: line thickness in pixels
+        Output: (N,N) float32 in {0,1}
+        """
+        mask = np.zeros((N, N), dtype=np.float32)
+
+        ix0 = int(box_min * N)
+        ix1 = int(box_max * N)
+        iy0 = int(box_min * N)
+        iy1 = int(box_max * N)
+
+        # clamp
+        ix0 = np.clip(ix0, 0, N-1); ix1 = np.clip(ix1, 0, N)
+        iy0 = np.clip(iy0, 0, N-1); iy1 = np.clip(iy1, 0, N)
+
+        # Zigzag: horizontal strokes (left->right, then right->left) as separate scanlines
+        # We encode only the "intended path footprint" as pixels = 1.
+        direction = 1
+        y = iy0
+        while y < iy1:
+            if direction == 1:
+                x_start, x_end = ix0, ix1 - 1
+            else:
+                x_start, x_end = ix1 - 1, ix0
+
+            # draw a horizontal line with thickness
+            y0 = max(0, y - thickness_px)
+            y1_ = min(N, y + thickness_px + 1)
+            if direction == 1:
+                mask[y0:y1_, x_start:x_end+1] = 1.0
+            else:
+                mask[y0:y1_, x_end:x_start+1] = 1.0
+
+            direction *= -1
+            y += spacing_px
+        return mask
+
+    def _build_snake_polyline(self, box_min: float, box_max: float, spacing_px: int = 6):
+        """
+        Build a continuous 'snake' polyline inside the box:
+        horizontal line, then vertical connector down to next line, alternating direction.
+        Returns:
+        pts: (M,2) array of (x,y) points in [0,1]
+        cumlen: (M,) cumulative arc length
+        """
+        N = self.height.shape[0]
+        ix0 = int(box_min * N)
+        ix1 = int(box_max * N) - 1
+        iy0 = int(box_min * N)
+        iy1 = int(box_max * N) - 1
+
+        # clamp
+        ix0 = int(np.clip(ix0, 0, N-1))
+        ix1 = int(np.clip(ix1, 0, N-1))
+        iy0 = int(np.clip(iy0, 0, N-1))
+        iy1 = int(np.clip(iy1, 0, N-1))
+
+        pts = []
+        direction = 1  # +1: left->right, -1: right->left
+        y = iy0
+
+        def pix2xy(px, py):
+            # center-of-pixel mapping into [0,1]
+            return (px + 0.5) / N, (py + 0.5) / N
+
+        while y <= iy1:
+            if direction == 1:
+                # horizontal stroke from left to right
+                x_start, x_end = ix0, ix1
+            else:
+                # horizontal stroke from right to left
+                x_start, x_end = ix1, ix0
+
+            x0, y0 = pix2xy(x_start, y)
+            x1, y1_ = pix2xy(x_end, y)
+
+            if len(pts) == 0:
+                pts.append([x0, y0])
+            else:
+                # ensure continuity (avoid duplicate)
+                if abs(pts[-1][0] - x0) > 1e-12 or abs(pts[-1][1] - y0) > 1e-12:
+                    pts.append([x0, y0])
+
+            pts.append([x1, y1_])
+
+            # vertical connector to next scanline (if any)
+            y_next = y + spacing_px
+            if y_next <= iy1:
+                x_vert = x_end  # connect at the end of current stroke
+                xv, yv0 = pix2xy(x_vert, y)
+                xv, yv1 = pix2xy(x_vert, y_next)
+                if abs(pts[-1][0] - xv) > 1e-12 or abs(pts[-1][1] - yv0) > 1e-12:
+                    pts.append([xv, yv0])
+                pts.append([xv, yv1])
+
+            direction *= -1
+            y = y_next
+
+        pts = np.asarray(pts, dtype=np.float32)
+
+        # cumulative arc length
+        dif = pts[1:] - pts[:-1]
+        seg = np.sqrt(np.sum(dif * dif, axis=1))
+        cumlen = np.concatenate([[0.0], np.cumsum(seg)]).astype(np.float32)
+        return pts, cumlen
+    
+    def _reverse_polyline(self, pts: np.ndarray):
+        pts_rev = pts[::-1].copy()
+        dif = pts_rev[1:] - pts_rev[:-1]
+        seg = np.sqrt(np.sum(dif * dif, axis=1))
+        cumlen_rev = np.concatenate([[0.0], np.cumsum(seg)]).astype(np.float32)
+        return pts_rev.astype(np.float32, copy=False), cumlen_rev
+    
+    def _build_snake_polyline_vertical(self, box_min: float, box_max: float, spacing_px: int = 6, between_pixels: bool = True):
+        N = self.height.shape[0]
+        ix0 = int(box_min * N)
+        ix1 = int(box_max * N) - 1
+        iy0 = int(box_min * N)
+        iy1 = int(box_max * N) - 1
+
+        ix0 = int(np.clip(ix0, 0, N-1))
+        ix1 = int(np.clip(ix1, 0, N-1))
+        iy0 = int(np.clip(iy0, 0, N-1))
+        iy1 = int(np.clip(iy1, 0, N-1))
+
+        pts = []
+        direction = 1  # +1: bottom->top, -1: top->bottom
+        x = ix0
+
+        def pix2xy(px, py):
+            # center-of-pixel (default): x=(px+0.5)/N
+            # between-pixels for vertical pass: shift x by +0.5 pixel -> x=(px+1.0)/N
+            x = (px + (1.0 if between_pixels else 0.5)) / N
+            y = (py + 0.5) / N
+            return x, y
+
+        x_last = (ix1 - 1) if between_pixels else ix1  # giữ đường shift nằm trong box
+        while x <= x_last:
+            if direction == 1:
+                y_start, y_end = iy0, iy1
+            else:
+                y_start, y_end = iy1, iy0
+
+            x0, y0 = pix2xy(x, y_start)
+            x1, y1_ = pix2xy(x, y_end)
+
+            if len(pts) == 0:
+                pts.append([x0, y0])
+            else:
+                if abs(pts[-1][0] - x0) > 1e-12 or abs(pts[-1][1] - y0) > 1e-12:
+                    pts.append([x0, y0])
+
+            pts.append([x1, y1_])
+
+            # horizontal connector to next scanline (if any)
+            x_next = x + spacing_px
+            if x_next <= x_last:
+                y_h = y_end
+                xh0, yh0 = pix2xy(x, y_h)
+                xh1, yh1 = pix2xy(x_next, y_h)
+                if abs(pts[-1][0] - xh0) > 1e-12 or abs(pts[-1][1] - yh0) > 1e-12:
+                    pts.append([xh0, yh0])
+                pts.append([xh1, yh1])
+
+            direction *= -1
+            x = x_next
+
+        pts = np.asarray(pts, dtype=np.float32)
+        dif = pts[1:] - pts[:-1]
+        seg = np.sqrt(np.sum(dif * dif, axis=1))
+        cumlen = np.concatenate([[0.0], np.cumsum(seg)]).astype(np.float32)
+        return pts, cumlen
+
+    def _snake_pose_at_s(self, s: float):
+        """
+        Given arc-length s along snake polyline, return:
+        base position (bx,by) and tangent (tx,ty) (unit)
+        """
+        s = float(np.clip(s, 0.0, float(self._snake_cumlen[-1])))
+        cum = self._snake_cumlen
+        pts = self._snake_pts
+
+        # find segment i such that cum[i] <= s < cum[i+1]
+        i = int(np.searchsorted(cum, s, side="right") - 1)
+        i = int(np.clip(i, 0, len(cum) - 2))
+
+        s0 = float(cum[i])
+        s1 = float(cum[i + 1])
+        p0 = pts[i]
+        p1 = pts[i + 1]
+
+        if s1 - s0 < 1e-12:
+            alpha = 0.0
+        else:
+            alpha = (s - s0) / (s1 - s0)
+
+        b = (1.0 - alpha) * p0 + alpha * p1
+        d = p1 - p0
+        L = float(np.sqrt(d[0]*d[0] + d[1]*d[1]) + 1e-12)
+        tx, ty = float(d[0] / L), float(d[1] / L)
+        bx, by = float(b[0]), float(b[1])
+        return bx, by, tx, ty
+    
+    def _loss_mse(self, h: np.ndarray, H_target: np.ndarray) -> float:
+        # Underfill error everywhere
+        under = np.maximum(0.0, H_target - h)
+        mse_under = float(np.mean(under ** 2))
+
+        # Overfill error everywhere
+        over = np.maximum(0.0, h - H_target)
+        mse_over = float(np.mean(over ** 2))
+
+        w_under = 1.0
+        w_over  = 1.0
+        return w_under * mse_under + w_over * mse_over
+
+    def step(self, action):
+        reward = 0.0
+        terminated = False
+        self._steps += 1 #step counter
+        f = self.f
+        N = self.height.shape[0]
+
+        # ============================
+        # 1) Unpack state & action
+        # ============================
+        x0, y0 = self.x, self.y #x0, y0, f0 = self.x, self.y, self.f #current tool state
+        # action = [a_v, a_off] in [-1,1]
+        a_v, a_off = np.asarray(action, dtype=np.float32)
+
+        # scale to physical meaning
+        # map a_v ∈ [-1,1]  →  v ∈ [0, v_max]  →  ds = v*dt ≥ 0
+        a = float(np.clip(a_v, -1.0, 1.0))
+        v = (a + 1.0) * 0.5 * float(self.cfg.v_max)   # v in [0, v_max]
+        step_along = v * float(self.cfg.dt)  
+        step_off   = float(np.clip(a_off, -1.0, 1.0)) * float(self.cfg.off_max)
+
+        # update snake progress + offset
+        ds = step_along                    # signed arc-length step
+        doff = step_off                    # signed lateral change
+
+        hit_end = False
+        s_next = float(self.s + ds)
+        if s_next >= float(self._snake_total):
+            s_next = float(self._snake_total)
+            hit_end = True
+        elif s_next <= 0.0:
+            s_next = 0.0
+
+        self.s = s_next
+        self.off = float(np.clip(self.off + doff, -0.10, 0.10))
+
+        bx, by, tx, ty = self._snake_pose_at_s(self.s)
+
+        # normal (unit)
+        nx, ny = -ty, tx
+
+        # new nozzle position: baseline + offset * normal
+        x1 = bx + self.off * nx
+        y1 = by + self.off * ny
+
+        # old nozzle position for deposition segment
+        x0, y0 = self.x, self.y
+        dx = x1 - x0
+        dy = y1 - y0
+
+        if x1 < 0 or x1 > 1 or y1 < 0 or y1 > 1:
+            print("TERMINATE: OOB")
+            s_norm = 0.0 if self._snake_total <= 1e-12 else float(self.s / self._snake_total)
+            obs = {
+                "height": self.height.copy(),
+                "state": np.array([self.x, self.y, s_norm, float(self.off)], dtype=np.float32),
+                "target_map": self.H_target_map.copy(),
+                "path_map": self.path_map.copy(),}
+            return obs, -10.0, True, False, {"reason": "out_of_bounds"}
+
+        # ===== Shaping prep: mean height before action (inside target box) =====
+        H_target = self.H_target_map
+        inside_box = H_target > 0.0
+        mu_before = float(np.mean(self.height[inside_box])) if np.any(inside_box) else 0.0
+        
+        if np.any(inside_box):
+            h_inside_before = self.height[inside_box]
+            min_before = float(np.percentile(h_inside_before, 1.0))
+        else:
+            min_before = 0.0
+
+        # ===== Delta-improvement reward: loss BEFORE deposition =====
+        H_target = self.H_target_map
+        h_before = self.height  # view (no copy needed)
+        loss_before = self._loss_mse(h_before, H_target)
+        delta_h = self.deposition.apply(self.height, x0, y0, x1, y1, f, self.cfg.dt, use_target_mask=False)
+        self.height = (self.height + delta_h).astype(np.float32, copy=False)
+        self.x, self.y, self.f = x1, y1, f
+
+        if hit_end:
+            if self.pass_id == 0:
+                # ===== switch to raster 2 (NO TERMINATION) =====
+                self.pass_id = 1
+
+                # reduce feedrate for raster 2
+                self.f = 0.5 * float(self.cfg.f_init)
+
+                # switch active snake
+                self._snake_pts = self._snake_pts_v
+                self._snake_cumlen = self._snake_cumlen_v
+                self._snake_total = self._snake_total_v
+
+                # reset arc-length + offset
+                self.s = 0.0
+                #self.off = 0.0
+                # continue episode (terminated stays False)
+            else:
+                # ===== hit-end AFTER raster 2 → TERMINATE =====
+                terminated = True
+
+        #hard constraint & heavy penalty
+        overfill_ratio = self.cfg.overfill_ratio        
+        H_target = self.H_target_map
+        h = self.height
+
+        inside_box  = H_target > 0.0
+        outside_box = H_target == 0.0
+
+        # inside box: h > h_target * overfill_ratio
+        viol_inside = np.any(
+            h[inside_box] > H_target[inside_box] * overfill_ratio
+        ) if np.any(inside_box) else False
+
+        # outside box: h > h_target * overfill_ratio = 0
+        viol_outside = np.any(h[outside_box] > 0.15)
+
+        if viol_inside or viol_outside:
+            s_norm = 0.0 if self._snake_total <= 1e-12 else float(self.s / self._snake_total)
+            obs = {
+                "height": self.height.copy(),
+                "state": np.array([self.x, self.y, s_norm, float(self.off)], dtype=np.float32),
+                "target_map": self.H_target_map.copy(),
+                "path_map": self.path_map.copy(),}
+            return obs, -10.0, True, False, {
+                "reason": "out_of_height",
+                "viol_inside": bool(viol_inside),
+                "viol_outside": bool(viol_outside),
+                "overfill_ratio": float(overfill_ratio),}
+
+        # ===== Delta-improvement reward: loss AFTER deposition =====
+        h_after = self.height
+        loss_after = self._loss_mse(h_after, H_target)
+
+        # Underfill error everywhere
+        under = np.maximum(0.0, H_target - h)
+        MSE_under = float(np.mean(under ** 2))
+
+        # Overfill error everywhere
+        over = np.maximum(0.0, h - H_target)
+        MSE_over  = float(np.mean(over ** 2))
+
+        # Weights
+        w_under = 1.0
+        w_over  = 1.0
+
+        # Reward = negative loss
+        reward -= (w_under * MSE_under + w_over * MSE_over)
+
+        log(f"[LOSS] before={loss_before:.6e}, after={loss_after:.6e}, delta={reward:.6e}")
+        log(f"[STEP {self._steps}] reward={reward:.6f}")
+
+        info = {
+            "loss_before": float(loss_before),
+            "loss_after": float(loss_after),
+            "reward": float(reward),}
+
+        s_norm = 0.0 if self._snake_total <= 1e-12 else float(self.s / self._snake_total)
+        obs = {
+            "height": self.height.copy(),
+            "state": np.array([self.x, self.y, s_norm, float(self.off)], dtype=np.float32),
+            "target_map": self.H_target_map.copy(),
+            "path_map": self.path_map.copy(),}
+        
+        #terminated = False
+        # ===== terminal penalty for hit_end AFTER raster 2 =====
+        if terminated:
+            reward = -10.0
+            info["reason"] = "hit_end_raster"
+        truncated = self._steps >= self.cfg.max_steps
+        return obs, float(reward), bool(terminated), bool(truncated), info
+
+class ColdSprayExtractor(BaseFeaturesExtractor):
+    """
+    Feature extractor used by PPO.
+    Combines:
+        - A CNN for spatial information from the height map + target map
+        - An MLP for local (x, y) + local target height at the nozzle
+    Output: 64-dim feature vector
+    """
+
+    def __init__(self, observation_space, features_dim=64, overfill_ratio=1.01):
+        super().__init__(observation_space, features_dim)
+        n = observation_space['height'].shape[0] #resolution of N×N maps
+
+        # Conv2d input has 2 channels: channel 0: current height map; channel 1: target map (0.2 inside box, 0.0 outside)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1) #downsampling
+        self.gap   = nn.AdaptiveAvgPool2d(1) #collapses spatial dimensions into single vector
+        self.cnn_fc = nn.Linear(64, 64) #convert CNN features into 64-dim embedding
+
+        # MLP 
+        self.mlp_fc = nn.Linear(6, 64) #self.mlp_fc = nn.Linear(3, 64)
+        #CNN branch (64) and MLP branch (64), vectors are concatenated into a 128-dim feature, then projected to final 64-dim vector.
+        self.shared = nn.Linear(128, 64)
+        self.ln = nn.LayerNorm(128)
+        self._features_dim = 64  # output features dim
+
+    def forward(self, obs):
+        # create a 2-channel tensor from height map and target map (batch, 2, N, N)
+        h = torch.stack([obs["height"], obs["target_map"], obs["path_map"]], dim=1)
+        h = F.relu(self.conv1(h))
+        h = F.relu(self.conv2(h))
+
+        # Compress spatial dimensions to (B, 64)
+        h = self.gap(h).flatten(1)
+
+        # 64-dim feature
+        h = F.relu(self.cnn_fc(h))
+
+        # extract (x,y) nozzle position from observation
+        xy = obs["state"][:, 0:2]          # x,y
+        s_off = obs["state"][:, 2:4]       # s_norm, off
+        B = xy.size(0)           # batch size
+        N = obs["target_map"].size(-1)  # map resolution
+
+        # convert (x, y) in [0,1] to pixel indices (0..N-1)
+        tx = (xy[:,0] * N).long().clamp(0, N-1)
+        ty = (xy[:,1] * N).long().clamp(0, N-1)
+
+        # local target height at nozzle
+        target_at_xy = obs["target_map"][torch.arange(B), ty, tx].unsqueeze(1)
+
+        # local path indicator at nozzle (0/1)
+        path_at_xy = obs["path_map"][torch.arange(B), ty, tx].unsqueeze(1)
+
+        # MLP input = [x, y, s_norm, off, target_at_xy, path_at_xy]
+        mlp_in = torch.cat([xy, s_off, target_at_xy, path_at_xy], dim=1)
+
+        # process local information into 64-dim representation
+        s = F.relu(self.mlp_fc(mlp_in))
+
+        # Concatenate global CNN features and local MLP features to 128 dims
+        z = torch.cat([h, s], dim=1)
+
+        # Normalize combined features to stabilize PPO training
+        z = self.ln(z)
+
+        # Final shared layer → 64-dim output for PPO policy + value networks
+        z = F.relu(self.shared(z))
+        return z
+    
+class NozzleTrajectoryCallback(BaseCallback):
+    """
+    Callback for visualizing the full nozzle trajectory during PPO training
+    Each PPO rollout consists of `n_steps` environment steps
+    """
+    def __init__(self, save_dir="train_rollouts", verbose=1):
+        super().__init__(verbose)
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        self.path_xy = []
+
+    # ------------------------------------------------
+    def _on_rollout_start(self):
+        """Reset the trajectory buffer at the beginning of each PPO rollout"""
+        self.path_xy = []
+        x = self.training_env.get_attr("x")[0]
+        y = self.training_env.get_attr("y")[0]
+        self.path_xy.append((x, y))
+        return True
+
+    # ------------------------------------------------
+    def _on_step(self):
+        """Record (x, y) at every environment step inside the rollout"""
+        x = self.training_env.get_attr("x")[0]
+        y = self.training_env.get_attr("y")[0]
+        self.path_xy.append((x, y))
+        return True
+
+    # ------------------------------------------------
+    def _on_rollout_end(self):
+        """
+        After PPO finishes collecting `n_steps`, the rollout ends. This function plots and saves the nozzle trajectory.
+        """
+        xs, ys = zip(*self.path_xy)
+
+        fig = plt.figure(figsize=(5,5))
+        plt.plot(xs, ys, '-', lw=1.5)
+        plt.scatter(xs[0], ys[0], c="green", s=50, label="Start")
+        plt.scatter(xs[-1], ys[-1], c="red", s=50, label="End")
+        plt.legend()
+        plt.xlim(0,1); plt.ylim(0,1)
+        plt.gca().set_aspect("equal")
+        plt.grid(alpha=0.3)
+        plt.title(f"Training Rollout – step={self.num_timesteps}")
+
+        fname = f"{self.save_dir}/rollout_{self.num_timesteps}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close()
+
+        if self.verbose: print(f"✓ Saved training rollout: {fname}")
+        return True
+    
+class TrajectoryBuffer:
+    def __init__(self):
+        self.obs = []
+        self.actions = []
+        self.logps = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+
+    def store(self, obs, act, rew, logp, val, done):
+        self.obs.append(obs)
+        self.actions.append(act)
+        self.rewards.append(rew)
+        self.logps.append(logp)
+        self.values.append(val)
+        self.dones.append(done)
+
+    def clear(self):
+        self.__init__()
+
+def rollout_stochastic(env, model, T):
+    obs, _ = env.reset()
+    path_xy = [(float(obs["state"][0]), float(obs["state"][1]))]
+    rewards = []
+    values = [get_value_from_obs(model, obs)]  # V(s0)
+
+    for t in range(T):
+        a_sto, _ = model.predict(obs, deterministic=False)
+        obs, r, terminated, truncated, _ = env.step(a_sto)
+        rewards.append(r)
+        path_xy.append((float(obs["state"][0]), float(obs["state"][1])))
+        values.append(get_value_from_obs(model, obs))   # V(s_{t+1})
+
+        if terminated or truncated:
+            break
+    return path_xy, rewards, values
+
+def rollout_deterministic_sb3(env, model, T):
+    obs, _ = env.reset()
+    path_xy = [(float(obs["state"][0]), float(obs["state"][1]))]
+    rewards = []; dones = []
+    values  = [get_value_from_obs(model, obs)]  # V(s0)
+
+    for t in range(T):
+        a_det, _ = model.predict(obs, deterministic=True)
+        obs, r, terminated, truncated, _ = env.step(a_det)
+        done = bool(terminated or truncated)
+        rewards.append(float(r))
+        dones.append(done)
+        path_xy.append((float(obs["state"][0]), float(obs["state"][1])))
+        values.append(get_value_from_obs(model, obs))   # V(s_{t+1})
+
+        if done:
+            break
+
+    return path_xy, rewards, values, dones, env.height.copy()
+
+def get_value_from_obs(model: PPO, obs: dict) -> float:
+    """
+    Return V(s) for a single observation dict in SB3 MultiInputPolicy.
+    """
+    device = model.device
+    with torch.no_grad():
+        obs_tensor, _ = model.policy.obs_to_tensor(obs)  # handles dict obs
+        v = model.policy.predict_values(obs_tensor)      # shape (1,1) or (1,)
+        return float(v.cpu().numpy().reshape(-1)[0])
+
+def compute_gae_value_targets(rewards, values, dones, gamma: float, gae_lambda: float):
+    """
+    Compute PPO critic targets (GAE 'returns'):
+      delta_t = r_t + gamma * V(s_{t+1}) * (1-done) - V(s_t)
+      A_t = delta_t + gamma*lambda*(1-done)*A_{t+1}
+      V_target_t = V(s_t) + A_t
+
+    Inputs:
+      rewards: list length T
+      values:  list length T+1   (V(s0)...V(sT))
+      dones:   list length T     (done at step t, True if terminated or truncated)
+    Outputs:
+      advantages: length T
+      value_targets: length T    (this is what PPO trains the critic to fit)
+    """
+    T = len(rewards)
+    advantages = np.zeros(T, dtype=np.float32)
+
+    gae = 0.0
+    for t in reversed(range(T)):
+        next_non_terminal = 1.0 - float(dones[t])
+        delta = rewards[t] + gamma * values[t + 1] * next_non_terminal - values[t]
+        gae = delta + gamma * gae_lambda * next_non_terminal * gae
+        advantages[t] = gae
+
+    value_targets = advantages + np.asarray(values[:-1], dtype=np.float32)
+    return advantages, value_targets
+
+def plot_det_critic_vs_target_return(epoch: int, det_rewards, det_values, det_dones,
+                                     gamma: float, gae_lambda: float, outdir="pics-ppo-8"):
+    """
+    Plot:
+      1) Critic prediction: V(s_t)
+      2) PPO critic target: GAE value target (a.k.a. 'GAE returns')
+    deterministic ONLY
+    """
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
+
+    # Compute PPO critic targets (GAE)
+    _, gae_value_targets = compute_gae_value_targets(
+        rewards=det_rewards,
+        values=det_values,       # length T+1
+        dones=det_dones,         # length T
+        gamma=gamma,
+        gae_lambda=gae_lambda
+    )
+
+    # Align:
+    # det_values is length T+1, but we plot V(s_t) for t=0..T-1 => values[:-1]
+    v_pred = np.asarray(det_values[:-1], dtype=np.float32)
+    v_targ = np.asarray(gae_value_targets, dtype=np.float32)
+
+    L = min(len(v_pred), len(v_targ))
+    v_pred = v_pred[:L]
+    v_targ = v_targ[:L]
+    t_axis = np.arange(L)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(t_axis, v_pred, label="Critic prediction  V(s_t)", lw=2)
+    plt.plot(t_axis, v_targ, label="PPO value target (GAE)", lw=2, alpha=0.8)
+
+    plt.xlabel("Time step t")
+    plt.ylabel("Value")
+    plt.title(f"Deterministic: Critic vs PPO GAE Target (epoch {epoch})")
+    plt.grid(alpha=0.3)
+    plt.legend()
+
+    savefile = f"{outdir}/critic_vs_gae_target_epoch_{epoch}.png"
+    plt.tight_layout()
+    plt.savefig(savefile, dpi=150)
+    plt.close()
+    print(f"✓ Saved: {savefile}")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = ColdSprayConfig(grid_n=128, rho_m=6500.0, eta=0.4, target_height=0.2,
+                      overfill_ratio=1.1, v_max=0.05, off_max=0.02, dt=2.0, 
+                      f_init=2.0, max_steps=200000, sigma=0.02, beta=1.0, seed=None)
+
+def _make_env():
+    return Monitor(ColdSprayEnv(cfg))
+
+venv = make_vec_env(_make_env, n_envs=2)
+
+policy_kwargs = dict(
+    features_extractor_class=ColdSprayExtractor,
+    features_extractor_kwargs=dict(features_dim=64, overfill_ratio=cfg.overfill_ratio),
+    net_arch=dict(
+        pi=[128,128],    
+        vf=[128,128]     
+    ),
+    log_std_init=-3.0,      
+)
+
+if os.path.exists("/netscratch/nham/checkpoints/best_model_8.zip"):
+    print(f"🔁 Resuming PPO from checkpoint: {BEST_MODEL_PATH}")
+    model = PPO.load(BEST_MODEL_PATH, env=venv, device=device, print_system_info=True)
+else:
+    print("🆕 Starting PPO training from scratch")
+    model = PPO(policy="MultiInputPolicy",
+        env=venv,
+        policy_kwargs=policy_kwargs,
+        learning_rate=1e-3,
+        n_steps=20000,
+        batch_size=500,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        verbose=0,
+        device=device,)
+
+def save_exploration_vs_deterministic(
+        epoch: int, 
+        det_path_xy, 
+        sto_path_xy, 
+        det_rewards, 
+        sto_rewards,
+        det_values,
+        sto_values,
+        det_height_map,
+        outdir="pics-ppo-8"
+    ):
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
+
+    xs_det, ys_det = zip(*det_path_xy)
+    xs_sto, ys_sto = zip(*sto_path_xy)
+
+    fig, axs = plt.subplots(1, 3, figsize=(16, 5))
+
+    # ======== 1) deterministic path ========
+    axs[0].plot(xs_det, ys_det, "-", lw=2, color="blue")
+    axs[0].scatter(xs_det[0], ys_det[0], c="green", s=60)
+    axs[0].scatter(xs_det[-1], ys_det[-1], c="red", s=60)
+    axs[0].set_title(f"Deterministic (mean) – epoch {epoch}")
+    axs[0].set_xlim(0, 1); axs[0].set_ylim(0, 1)
+    axs[0].set_aspect("equal")
+    axs[0].grid(alpha=0.3)
+
+    # ======== 2) stochastic path ========
+    axs[1].plot(xs_sto, ys_sto, "--", lw=1.6, color="orange")
+    axs[1].scatter(xs_sto[0], ys_sto[0], c="green", s=60)
+    axs[1].scatter(xs_sto[-1], ys_sto[-1], c="red", s=60)
+    axs[1].set_title(f"Exploration (sampling) – epoch {epoch}")
+    axs[1].set_xlim(0, 1); axs[1].set_ylim(0, 1)
+    axs[1].set_aspect("equal")
+    axs[1].grid(alpha=0.3)
+
+    # ======== 3) height map after deterministic rollout ========
+    hm = axs[2].imshow(det_height_map, cmap="viridis", origin="upper")
+    axs[2].invert_yaxis() 
+    axs[2].set_title("Height map after deterministic rollout")
+    fig.colorbar(hm, ax=axs[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    savefile = f"{outdir}/rollout_epoch_{epoch}.png"
+    plt.savefig(savefile, dpi=150)
+    plt.close()
+    print(f"✓ Saved: {savefile}")
+
+    # =============================
+    # === Reward curves over T ===
+    # =============================
+    plt.figure(figsize=(7,4))
+    plt.plot(det_rewards, label="Deterministic", lw=2)
+    plt.plot(sto_rewards, label="Stochastic", lw=1.5, alpha=0.7)
+    plt.xlabel("Time step")
+    plt.ylabel("Reward")
+    plt.title(f"Reward curves – epoch {epoch}")
+    plt.legend()
+    plt.grid(alpha=0.3)
+
+    savefile2 = f"{outdir}/reward_curve_epoch_{epoch}.png"
+    plt.savefig(savefile2, dpi=150)
+    plt.close()
+    print(f"✓ Saved: {savefile2}")
+
+def train_sb3(env_cfg, model, N_epochs=10, log_path="training_log_ppo_8.txt"):
+    eval_env = ColdSprayEnv(env_cfg); eval_env.reset()
+
+    H_target = eval_env.H_target_map.copy()
+    rmse_history, reward_history = [], []
+    global_path_xy = []
+    best_mean_h = -float("inf")
+    best_epoch = -1
+
+    lr = model.lr_schedule(1)
+    last_improvement_epoch = 0
+
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    log_file = open(log_path, "w", encoding="utf-8")
+    log_file.write("Epoch\tRMSE\tMinH\tMaxH\tMeanH\n")
+
+    # not reset timestep
+    n_steps_chunk = model.n_steps * model.n_epochs #=max_steps
+
+    for epoch in range(N_epochs):
+        print(f"\n🚀 Epoch {epoch}/{N_epochs} ...")
+        #callback = NozzleTrajectoryCallback(save_dir="/netscratch/nham/train_ppo_rollouts")
+        model.learn(total_timesteps=n_steps_chunk, reset_num_timesteps=False, progress_bar=False)
+        print("✅ done")
+        obs, _ = eval_env.reset(options=None)
+
+        # rollout deterministic on eval_env
+        path_xy, det_rewards, det_values, det_dones, det_height_map = rollout_deterministic_sb3(eval_env, model, T=env_cfg.max_steps)
+        global_path_xy.extend(path_xy)
+        total_reward = float(sum(det_rewards))
+        log(f"[Epoch {epoch:04d}] Total deterministic reward = {total_reward:.4f}")
+
+        H_t = eval_env.height.copy()
+
+        rmse = float(np.sqrt(np.mean((H_t - H_target)**2)))
+
+        rmse_history.append(rmse)
+        reward_history.append(np.nan) 
+
+        inside_box = H_target > 0.0
+        min_h_inside = float(np.min(H_t[inside_box])) if np.any(inside_box) else np.nan
+        max_h_inside = float(np.max(H_t[inside_box])) if np.any(inside_box) else np.nan
+        mean_h_inside = float(np.mean(H_t[inside_box])) if np.any(inside_box) else np.nan
+        log_file.write(f"{epoch}\t{rmse:.6f}\t{min_h_inside:.6f}\t{max_h_inside:.6f}\t{mean_h_inside:.6f}\n")
+        log_file.flush()
+
+        log(f"[Epoch {epoch:04d}] RMSE={rmse:.6f}  MinH={min_h_inside:.4f}  MaxH={max_h_inside:.4f}  MeanH={mean_h_inside:.4f}")
+
+        if mean_h_inside > best_mean_h:
+            best_mean_h = mean_h_inside
+            best_epoch = epoch
+            last_improvement_epoch = epoch
+
+            print(f"\n📈 New best MeanH ({mean_h_inside:.6f}) at epoch {epoch}. Saving visualization...")
+
+            model.save(BEST_MODEL_PATH)
+            print(f"💾 Saved BEST model to {BEST_MODEL_PATH}.zip")
+            
+            det_path_xy, det_rewards, det_values, det_dones, det_height_map = rollout_deterministic_sb3(eval_env, model, T=100000)
+            sto_path_xy, sto_rewards, sto_values = rollout_stochastic(eval_env, model, T=100000)
+
+            plot_det_critic_vs_target_return(
+                epoch=epoch,
+                det_rewards=det_rewards,
+                det_values=det_values,
+                det_dones=det_dones,
+                gamma=model.gamma,
+                gae_lambda=model.gae_lambda,
+                outdir="/netscratch/nham/logs/pics-ppo-8")
+
+            save_exploration_vs_deterministic(
+                epoch=epoch,
+                det_path_xy=det_path_xy,
+                sto_path_xy=sto_path_xy,
+                det_rewards=det_rewards,
+                sto_rewards=sto_rewards,
+                det_values=det_values,
+                sto_values=sto_values,
+                det_height_map=det_height_map,
+                outdir="/netscratch/nham/logs/pics-ppo-8")
+
+        # reduce learning rate if no improvement for 50 epochs
+        if (epoch - last_improvement_epoch) >= 30:
+            new_lr = lr * 0.5
+            new_lr = max(new_lr, 1e-5)  
+            print(f"⚠️ No improvement for 50 epochs → reducing LR: {lr:.2e} → {new_lr:.2e}")
+
+            model.learning_rate = new_lr
+            model.lr_schedule = lambda _: new_lr  
+
+            lr = new_lr
+            last_improvement_epoch = epoch 
+
+    log_file.close()
+    print(f"\n✅ Training complete. Log saved to: {os.path.abspath(log_path)}")
+
+if __name__ == "__main__":
+    print("Training SB3-PPO on ColdSprayEnv ...")
+    train_sb3(cfg, model, N_epochs=500, log_path="training_log_ppo_8.txt")
